@@ -1,0 +1,215 @@
+<!-- templates/index.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Weather Advisor — Chat + Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Minimal styling via PicoCSS (small, no build step) -->
+  <link rel="stylesheet" href="https://unpkg.com/@picocss/pico@2/css/pico.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    body { padding-top: 1rem; }
+    .card { border-radius: 16px; box-shadow: 0 6px 18px rgba(0,0,0,.08); padding: 1rem 1.2rem; }
+    .grid { gap: 1.2rem; }
+    .chat-box { height: 300px; overflow-y: auto; padding: .6rem .8rem; border: 1px solid #e6e6e6; border-radius: 12px; background: #fafafa; }
+    .msg { margin: .4rem 0; }
+    .msg.user { text-align: right; }
+    .bubble {
+      display: inline-block; padding: .5rem .75rem; border-radius: 14px;
+      background: #f0f7ff;
+    }
+    .msg.user .bubble { background: #e7ffe9; }
+    .tiny { font-size: .875rem; color: #666; }
+    canvas { max-height: 340px; }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <h2>🌤️ Weather Advisor — Chat & Dashboard</h2>
+    <p class="tiny">Ask natural questions (e.g., “Do I need an umbrella today in Perth?”) or explore the charts.</p>
+
+    <div class="grid">
+      <!-- Chatbot Card -->
+      <section class="card">
+        <h4>Weather Chat</h4>
+        <div class="grid">
+          <div>
+            <label for="defaultLocation">Default location (optional)</label>
+            <input id="defaultLocation" type="text" placeholder="e.g., Perth" />
+          </div>
+        </div>
+
+        <div class="chat-box" id="chatBox" aria-live="polite"></div>
+
+        <form id="chatForm" style="margin-top: .8rem;">
+          <input id="chatInput" type="text" placeholder="Ask: Do I need an umbrella today in Perth?" required />
+          <button type="submit">Send</button>
+        </form>
+      </section>
+
+      <!-- Dashboard Card -->
+      <section class="card">
+        <h4>Weather Dashboard</h4>
+
+        <form id="dashForm" class="grid">
+          <div>
+            <label for="cityInput">City / Location</label>
+            <input id="cityInput" type="text" placeholder="e.g., Perth" required />
+          </div>
+          <div>
+            <label for="daysInput">Days</label>
+            <select id="daysInput">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3" selected>3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+            </select>
+          </div>
+          <div style="align-self: end;">
+            <button type="submit">Update Charts</button>
+          </div>
+        </form>
+
+        <article>
+          <h6>Temperature Trend</h6>
+          <canvas id="tempChart" aria-label="Temperature chart" role="img"></canvas>
+        </article>
+
+        <article style="margin-top: .8rem;">
+          <h6>Precipitation Chances</h6>
+          <canvas id="rainChart" aria-label="Precipitation chart" role="img"></canvas>
+        </article>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    // --- Chat UI ---
+    const chatBox = document.getElementById('chatBox');
+    const chatForm = document.getElementById('chatForm');
+    const chatInput = document.getElementById('chatInput');
+    const defaultLocation = document.getElementById('defaultLocation');
+
+    function addMsg(text, who='bot') {
+      const div = document.createElement('div');
+      div.className = `msg ${who}`;
+      const bubble = document.createElement('span');
+      bubble.className = 'bubble';
+      bubble.textContent = text;
+      div.appendChild(bubble);
+      chatBox.appendChild(div);
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    chatForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const q = chatInput.value.trim();
+      if (!q) return;
+      addMsg(q, 'user');
+      chatInput.value = '';
+
+      try {
+        const res = await fetch('/api/ask', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            question: q,
+            default_location: defaultLocation.value.trim()
+          })
+        });
+        const data = await res.json();
+        addMsg(data.answer || (data.error || "Sorry, something went wrong."), 'bot');
+      } catch (err) {
+        addMsg("Network error. Please try again.", 'bot');
+      }
+    });
+
+    // --- Dashboard UI (Chart.js) ---
+    const tempCtx = document.getElementById('tempChart').getContext('2d');
+    const rainCtx = document.getElementById('rainChart').getContext('2d');
+
+    let tempChart, rainChart;
+
+    function makeTempChart(labels, min, avg, max) {
+      if (tempChart) tempChart.destroy();
+      tempChart = new Chart(tempCtx, {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [
+            { label: 'Min °C', data: min },
+            { label: 'Avg °C', data: avg },
+            { label: 'Max °C', data: max }
+          ]
+        },
+        options: {
+          responsive: true,
+          plugins: { legend: { position: 'top' }, title: { display: false } },
+          scales: {
+            y: { title: { display: true, text: 'Temperature (°C)' } },
+            x: { title: { display: true, text: 'Date' } }
+          }
+        }
+      });
+    }
+
+    function makeRainChart(labels, chance) {
+      if (rainChart) rainChart.destroy();
+      rainChart = new Chart(rainCtx, {
+        type: 'line',
+        data: { labels, datasets: [{ label: 'Chance of Rain (%)', data: chance }] },
+        options: {
+          responsive: true,
+          plugins: { legend: { position: 'top' }, title: { display: false } },
+          scales: {
+            y: { min: 0, max: 100, title: { display: true, text: 'Chance (%)' } },
+            x: { title: { display: true, text: 'Date' } }
+          }
+        }
+      });
+    }
+
+    async function loadCharts(city, days) {
+      const q = new URLSearchParams({ location: city, days: String(days) });
+
+      // Temperature
+      const tr = await fetch('/api/temps?' + q.toString());
+      const t = await tr.json();
+      if (t.error) {
+        alert(t.error);
+        return;
+      }
+      makeTempChart(t.dates, t.min, t.avg, t.max);
+
+      // Rain
+      const rr = await fetch('/api/rain?' + q.toString());
+      const r = await rr.json();
+      if (r.error) {
+        alert(r.error);
+        return;
+      }
+      makeRainChart(r.dates, r.chance);
+    }
+
+    const dashForm = document.getElementById('dashForm');
+    const cityInput = document.getElementById('cityInput');
+    const daysInput = document.getElementById('daysInput');
+
+    dashForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const city = cityInput.value.trim();
+      if (!city) return;
+      const days = parseInt(daysInput.value || '3', 10);
+      await loadCharts(city, days);
+    });
+
+    // Optional: show a default example on load
+    window.addEventListener('DOMContentLoaded', () => {
+      cityInput.value = 'Perth';
+      loadCharts('Perth', 3);
+    });
+  </script>
+</body>
+</html>
