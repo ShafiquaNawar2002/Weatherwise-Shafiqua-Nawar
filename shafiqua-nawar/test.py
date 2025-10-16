@@ -1,8 +1,8 @@
-# Weather Advisor - Fast + Humanized Answers (with location sanitiser)
-# -------------------------------------------------------------------
+# Weather Advisor - Human-First Answers Everywhere (with location sanitiser)
+# -------------------------------------------------------------------------
 # Run:
 #   pip install requests matplotlib
-#   python weather_advisor_fast_human.py
+#   python weather_advisor_human_first.py
 #
 # Optional (Ollama for parsing; otherwise a fast rule-based parser is used):
 #   ollama serve
@@ -19,61 +19,44 @@ WTTR_TIMEOUT_SECS = 6
 OLLAMA_TIMEOUT_SECS = 4
 MAX_FORECAST_DAYS = 5
 
-# --- NEW: sanitize location to prevent "Perth Tomorrow" 404s ---
+# --- Location sanitizer to prevent "Perth Tomorrow" 404s ---
 _TIME_TOKENS = {
     "today", "tomorrow", "tonight", "weekend", "morning", "afternoon", "evening",
     "next", "day", "days", "week", "weeks", "month", "months",
     "monday","tuesday","wednesday","thursday","friday","saturday","sunday",
-    "this"  # e.g., "this weekend"
+    "this"
 }
 _PREP_TOKENS = {"in", "at", "on", "for"}
 
 def sanitize_location(raw: str) -> str:
-    """
-    Remove time words / prepositions / stray numbers from a user-entered 'location'.
-    Keeps letters, spaces, hyphens, and apostrophes (for names like O'Connor).
-    """
     if not isinstance(raw, str):
         return ""
-    # Keep alpha, space, hyphen, apostrophe, comma
     cleaned = re.sub(r"[^A-Za-z\s\-\',]", " ", raw.strip())
     parts = [p for p in re.split(r"[,\s]+", cleaned) if p]
     keep = []
     for p in parts:
         low = p.lower()
-        if low in _TIME_TOKENS:     # drop time words
+        if low in _TIME_TOKENS:  # drop time words
             continue
-        if low in _PREP_TOKENS:     # drop prepositions often pasted in
+        if low in _PREP_TOKENS:  # drop prepositions
             continue
-        if low.isdigit():           # drop numbers from phrases like "next 3 days"
+        if low.isdigit():        # drop numbers
             continue
         keep.append(p)
-    loc = " ".join(keep).strip(" ,")
-    return loc
+    return " ".join(keep).strip(" ,")
 
 # ------------------------------
 # 1) Data retrieval (wttr.in)
 # ------------------------------
 def get_weather_data(location, forecast_days=5):
-    """
-    Retrieve weather data for a specified location.
-
-    Args:
-        location (str): City or location name
-        forecast_days (int): Number of days to forecast (1-5)
-
-    Returns:
-        dict or None
-    """
-    # NEW: sanitize the location (fixes "Perth Tomorrow")
     location = sanitize_location(location)
     if not location:
         print("Please provide a valid location (e.g., 'Perth').")
         return None
 
     days = max(1, min(MAX_FORECAST_DAYS, int(forecast_days or 3)))
-
     url = f"https://wttr.in/{location}?format=j1"
+
     try:
         r = requests.get(url, timeout=WTTR_TIMEOUT_SECS)
         r.raise_for_status()
@@ -81,7 +64,7 @@ def get_weather_data(location, forecast_days=5):
 
         current = (data.get("current_condition") or [{}])[0]
         forecast_raw = data.get("weather") or []
-        forecast = forecast_raw[:days]  # wttr.in usually returns up to 3 days
+        forecast = forecast_raw[:days]  # wttr.in typically returns 3 days
 
         return {"location": location.title(), "current": current, "forecast": forecast}
     except Exception as e:
@@ -157,7 +140,6 @@ def _ollama_disabled():
     return os.environ.get("WEATHER_ADVISOR_DISABLE_OLLAMA", "").strip() == "1"
 
 def _call_ollama(prompt, model=None, temperature=0.0, json_only=True):
-    """Return text from Ollama or None on any issue (fast timeout)."""
     if _ollama_disabled():
         return None
     try:
@@ -174,74 +156,88 @@ def _call_ollama(prompt, model=None, temperature=0.0, json_only=True):
             if s != -1 and e != -1: text = text[s:e+1]
         return text
     except Exception:
-        return None  # instant fallback
+        return None
 
+# --- Intent + parsing ---
 def parse_weather_question(question):
     """
-    Returns dict: {location, days, when, attribute}
+    Returns dict:
+      {
+        location, days, when, attribute, tags: set(...), question_text
+      }
     when ∈ {'today','tomorrow','next_n_days'}
     attribute ∈ {'temperature','precipitation','rain','wind','humidity','summary'}
     """
-    question = (question or "").strip()
-    if not question:
-        return {"location": None, "days": 3, "when": "today", "attribute": "summary"}
+    qorig = (question or "").strip()
+    if not qorig:
+        return {"location": None, "days": 3, "when": "today", "attribute": "summary", "tags": set(), "question_text": ""}
 
-    # Try LLM parse first (quick timeout)
+    qlow = qorig.lower()
+
+    # Tags capture user's intent nuances for humanised answers
+    tags = set()
+    if any(w in qlow for w in ["umbrella", "raincoat"]): tags.add("umbrella")
+    if "feel cold" in qlow or ("cold" in qlow and ("feel" in qlow or "will i" in qlow or "do i" in qlow)): tags.add("feel_cold")
+    if "feel warm" in qlow or ("warm" in qlow and ("feel" in qlow or "will i" in qlow or "do i" in qlow)): tags.add("feel_warm")
+    if "feel hot"  in qlow or ("hot"  in qlow and ("feel" in qlow or "will i" in qlow or "do i" in qlow)): tags.add("feel_hot")
+    if any(w in qlow for w in ["windy", "strong wind", "gust"]): tags.add("windy")
+    if any(w in qlow for w in ["humid", "muggy", "sticky"]): tags.add("humid")
+    if any(w in qlow for w in ["jacket", "coat", "sweater", "hoodie"]): tags.add("clothing")
+    if any(w in qlow for w in ["run", "picnic", "beach", "hike", "outdoor", "game"]): tags.add("outdoors")
+    if any(w in qlow for w in ["cancel", "safe", "dangerous", "storm"]): tags.add("safety")
+
+    # Try LLM parse first (fast timeout)
     system = (
         "You are a weather question parser. Output JSON with keys: "
         "location (string|null), days (1..5), when ('today'|'tomorrow'|'next_n_days'), "
         "attribute ('temperature'|'rain'|'precipitation'|'wind'|'humidity'|'summary'). "
         "If 'this weekend' -> next_n_days + days=3. Default: location=null, days=3, when='today', attribute='summary'."
     )
-    prompt = f"{system}\nUser question: {question}\nJSON:"
+    prompt = f"{system}\nUser question: {qorig}\nJSON:"
     llm_text = _call_ollama(prompt, json_only=True)
 
     if llm_text:
         try:
             p = json.loads(llm_text)
-            loc = sanitize_location(p.get("location") or "")
-            loc = loc or None
+            loc = sanitize_location(p.get("location") or "") or None
             days = max(1, min(MAX_FORECAST_DAYS, int(p.get("days", 3))))
             when = p.get("when", "today")
             if when not in ("today","tomorrow","next_n_days"): when = "today"
             attr = p.get("attribute","summary")
             if attr not in ("temperature","rain","precipitation","wind","humidity","summary"):
                 attr = "summary"
-            return {"location": loc, "days": days, "when": when, "attribute": attr}
+            return {"location": loc, "days": days, "when": when, "attribute": attr, "tags": tags, "question_text": qorig}
         except Exception:
-            pass  # fall through
+            pass
 
     # Rule-based fallback
-    q = question.lower()
-    # capture text after "in|at" but stop before time words if present
     loc = None
-    m = re.search(r"\b(?:in|at)\s+([A-Za-z][A-Za-z\s\-']{1,60})", q)
+    m = re.search(r"\b(?:in|at|for)\s+([A-Za-z][A-Za-z\s\-']{1,60})", qlow)
     if m:
-        loc = sanitize_location(m.group(1))
-        if not loc:
-            loc = None
+        loc = sanitize_location(m.group(1)) or None
 
     days, when = 3, "today"
-    if "tomorrow" in q: when, days = "tomorrow", 1
-    m = re.search(r"\bnext\s+(\d)\s+day", q)
+    if "tomorrow" in qlow: when, days = "tomorrow", 1
+    m = re.search(r"\bnext\s+(\d)\s+day", qlow)
     if m:
         when = "next_n_days"
         days = max(1, min(MAX_FORECAST_DAYS, int(m.group(1))))
-    if "weekend" in q: when, days = "next_n_days", 3
+    if "weekend" in qlow: when, days = "next_n_days", 3
 
-    if any(w in q for w in ["rain", "umbrella", "precip"]):
+    if any(w in qlow for w in ["rain", "umbrella", "precip"]):
         attribute = "precipitation"
-    elif any(w in q for w in ["windy", "wind"]):
+    elif any(w in qlow for w in ["windy", "wind", "gust"]):
         attribute = "wind"
-    elif any(w in q for w in ["humid", "humidity"]):
+    elif any(w in qlow for w in ["humid", "humidity", "muggy"]):
         attribute = "humidity"
-    elif any(w in q for w in ["hot", "cold", "warm", "temp", "temperature"]):
+    elif any(w in qlow for w in ["hot", "cold", "warm", "temp", "temperature"]):
         attribute = "temperature"
     else:
         attribute = "summary"
 
-    return {"location": loc, "days": days, "when": when, "attribute": attribute}
+    return {"location": loc, "days": days, "when": when, "attribute": attribute, "tags": tags, "question_text": qorig}
 
+# --- helpers for humanized responses ---
 def _pick_day_slice(weather_data, when, days):
     days_list = weather_data.get("forecast", [])
     if not days_list: return []
@@ -275,53 +271,132 @@ def _avg_humidity(day):
         except: pass
     return int(round(total / count)) if count else 0
 
-def _yes_maybe_no_from_rain(chance):
-    if chance >= 60:   return "Yes—bring an umbrella."
-    if chance >= 30:   return "Maybe—pack one just in case."
-    return "Probably not—rain chance is low."
+def _midday_desc(day):
+    for h in (day.get("hourly") or []):
+        if h.get("time") in ("1200","900","1500"):
+            wdesc = h.get("weatherDesc")
+            if isinstance(wdesc, list) and wdesc:
+                return wdesc[0].get("value")
+            break
+    for h in (day.get("hourly") or []):
+        wdesc = h.get("weatherDesc")
+        if isinstance(wdesc, list) and wdesc:
+            return wdesc[0].get("value")
+    return None
 
-def _wind_label(kmph):
-    if kmph >= 60: return "very windy"
-    if kmph >= 40: return "windy"
-    if kmph >= 25: return "a bit breezy"
-    return "light winds"
-
-# NEW: compact daily description line
 def _day_brief(day):
     date = day.get("date", "Unknown date")
     avgc = day.get("avgtempC", "?")
     minc = day.get("mintempC", "?")
     maxc = day.get("maxtempC", "?")
     chance = _max_rain_chance(day)
-    # try to grab a midday-ish description
-    desc = None
-    for h in (day.get("hourly") or []):
-        if h.get("time") in ("1200","900","1500"):
-            wdesc = h.get("weatherDesc")
-            if isinstance(wdesc, list) and wdesc:
-                desc = wdesc[0].get("value")
-            break
-    if not desc:
-        # fallback: any description
-        for h in (day.get("hourly") or []):
-            wdesc = h.get("weatherDesc")
-            if isinstance(wdesc, list) and wdesc:
-                desc = wdesc[0].get("value"); break
-    desc = desc or "—"
+    desc = _midday_desc(day) or "—"
     return f"{date}: ~{avgc}°C (min {minc}°C / max {maxc}°C), rain up to {chance}%, {desc}"
 
-# UPDATED: Answer first, then forecast block
+# --- comfort heuristics ---
+def _to_int(s, default=None):
+    try:
+        return int(s)
+    except:
+        return default
+
+def _feel_label(avgc_int):
+    if avgc_int is None:
+        return "mild"
+    if avgc_int <= 16: return "cold"
+    if avgc_int >= 27: return "warm"
+    return "mild"
+
+def _pleasant_yesno(day):
+    avgc = _to_int(day.get("avgtempC"))
+    rain = _max_rain_chance(day)
+    wind = _wind_max_kmph(day)
+    hum  = _avg_humidity(day)
+
+    # “No” triggers
+    if rain >= 60: return "No, conditions look wet."
+    if wind >= 60: return "No, it'll be very windy."
+    if avgc is not None and (avgc <= 10 or avgc >= 33): return "No, temperatures look uncomfortable."
+    if hum >= 85: return "No, it may feel uncomfortably humid."
+    # “Maybe” trigger
+    if 30 <= rain < 60 or 40 <= wind < 60:
+        return "Maybe—conditions are borderline."
+    return "Yes, it should be pleasant."
+
+# --- universal human-first sentence ---
+def _human_first_sentence(parsed, weather_data, day):
+    q = (parsed.get("question_text") or "").lower()
+    when_txt = parsed.get("when", "today").replace("_"," ")
+    loc = weather_data.get("location", "your location")
+    tags = parsed.get("tags", set())
+
+    avgc = _to_int(day.get("avgtempC"))
+    minc = day.get("mintempC", "?")
+    maxc = day.get("maxtempC", "?")
+    rain = _max_rain_chance(day)
+    wind = _wind_max_kmph(day)
+    hum  = _avg_humidity(day)
+
+    # 1) Direct yes/no for FEEL temperature queries
+    if "feel_cold" in tags:
+        if avgc is not None and avgc <= 16:
+            return f"Yes, you will feel cold {when_txt} in {loc}."
+        return f"No, it should feel {('warm' if avgc is not None and avgc >= 24 else 'mild')} {when_txt} in {loc}."
+
+    if "feel_warm" in tags or "feel_hot" in tags:
+        if avgc is not None and avgc >= 27:
+            return f"Yes, it will feel warm {when_txt} in {loc}."
+        return f"No, it won't be warm—more like {('cool' if avgc is not None and avgc <= 16 else 'mild')}."
+
+    # 2) Umbrella / rain
+    if "umbrella" in tags or parsed.get("attribute") in ("rain","precipitation"):
+        if rain >= 60:  return f"Yes, bring an umbrella {when_txt} in {loc}."
+        if rain >= 30:  return f"Maybe—pack a small umbrella just in case {when_txt} in {loc}."
+        return f"No, you probably don't need an umbrella {when_txt} in {loc}."
+
+    # 3) Windy?
+    if "windy" in tags or parsed.get("attribute") == "wind":
+        if wind >= 60:  return f"Yes, it’ll be very windy {when_txt} in {loc} (gusts ~{wind} km/h)."
+        if wind >= 40:  return f"Somewhat—expect windy conditions {when_txt} in {loc} (up to ~{wind} km/h)."
+        return f"No, just light to moderate winds {when_txt} in {loc}."
+
+    # 4) Humidity?
+    if "humid" in tags or parsed.get("attribute") == "humidity":
+        if hum >= 70:   return f"Yes, it may feel muggy {when_txt} in {loc} (humidity ~{hum}%)."
+        return f"No, humidity looks manageable {when_txt} in {loc} (around {hum}%)."
+
+    # 5) Clothing hints
+    if "clothing" in tags:
+        feel = _feel_label(avgc)
+        if feel == "cold":
+            return f"Yes, take a jacket—{when_txt} in {loc} looks chilly (avg ~{avgc}°C)."
+        if feel == "warm":
+            return f"No heavy layers needed—{when_txt} in {loc} looks warm (avg ~{avgc}°C)."
+        return f"A light layer should be fine—{when_txt} in {loc} looks mild (avg ~{avgc}°C)."
+
+    # 6) Outdoors / safety quick read
+    if "safety" in tags or "outdoors" in tags:
+        verdict = _pleasant_yesno(day)
+        return f"{verdict} {when_txt} in {loc}"
+
+    # 7) Generic nice yes/no for any other “Do/Should/Will/Is/Can … ?” style
+    if re.match(r"^\s*(do|should|will|is|can|are|am)\b", q):
+        verdict = _pleasant_yesno(day)
+        return f"{verdict} {when_txt} in {loc}"
+
+    # 8) Default short summary if it wasn’t a question
+    feel = _feel_label(avgc)
+    return (f"In {loc} {when_txt}, expect {feel} conditions around {day.get('avgtempC','?')}°C "
+            f"(min {minc}°C / max {maxc}°C) with up to {rain}% chance of rain.")
+
+# --- Answer first, then forecast block
 def generate_weather_response(parsed_question, weather_data):
-    """
-    HUMANIZED answer first, then a concise Forecast section.
-    """
     if not weather_data:
         return "Sorry, I couldn't retrieve weather data right now."
 
     loc = weather_data.get("location", "your location")
     when = parsed_question.get("when", "today")
     days = parsed_question.get("days", 3)
-    attribute = parsed_question.get("attribute", "summary")
 
     selected_days = _pick_day_slice(weather_data, when, days)
     if not selected_days:
@@ -329,26 +404,10 @@ def generate_weather_response(parsed_question, weather_data):
 
     d0 = selected_days[0]
 
-    # --- Humanised lead line ---
-    if attribute in ("precipitation", "rain"):
-        chance = _max_rain_chance(d0)
-        lead = f"{_yes_maybe_no_from_rain(chance)} ({chance}% chance of rain {when.replace('_',' ')} in {loc})."
-    elif attribute == "temperature":
-        avgc = d0.get("avgtempC", "?"); minc = d0.get("mintempC", "?"); maxc = d0.get("maxtempC", "?")
-        lead = f"Expect about {avgc}°C in {loc} {when.replace('_',' ')} (min {minc}°C / max {maxc}°C)."
-    elif attribute == "wind":
-        w = _wind_max_kmph(d0)
-        lead = f"It'll be {_wind_label(w)} in {loc} {when.replace('_',' ')} (gusts up to ~{w} km/h)."
-    elif attribute == "humidity":
-        h = _avg_humidity(d0)
-        lead = f"Humidity in {loc} {when.replace('_',' ')} will average around {h}%."
-    else:
-        avgc = d0.get("avgtempC", "?"); minc = d0.get("mintempC", "?"); maxc = d0.get("maxtempC", "?")
-        chance = _max_rain_chance(d0)
-        lead = (f"In {loc} {when.replace('_',' ')}, expect about {avgc}°C "
-                f"(min {minc}°C / max {maxc}°C) with up to {chance}% chance of rain.")
+    # 1) Human-first line (always)
+    lead = _human_first_sentence(parsed_question, weather_data, d0)
 
-    # --- Forecast block ---
+    # 2) Forecast bullets
     header_when = {"today":"Today","tomorrow":"Tomorrow"}.get(when, when.replace("_"," ").title())
     lines = [lead, "", f"Forecast for {loc} — {header_when}:" if len(selected_days)==1
              else f"Forecast for {loc} — next {len(selected_days)} days:"]
@@ -409,11 +468,10 @@ def run_menu():
                 print("(Close the chart window to return here.)")
                 create_precipitation_visualisation(wd, output_type='display')
         else:
-            q = input("\nAsk about the weather (e.g., 'Do I need an umbrella tomorrow in Perth?')\n> ").strip()
+            q = input("\nAsk about the weather (e.g., 'Do I feel cold tomorrow at Melbourne?')\n> ").strip()
             parsed = parse_weather_question(q)
             loc = parsed.get("location")
             if not loc:
-                # If user types "tomorrow" without a location, ask.
                 loc_input = input("Which location? ").strip()
                 loc = sanitize_location(loc_input) or "Perth"
                 parsed["location"] = loc
